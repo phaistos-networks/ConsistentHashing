@@ -13,16 +13,7 @@
 // You should operate on ring segments, and for a typical distributed service, each segment will be owned by a primary replica, and based on
 // replication strategies and factors, more(usually, the successor) segments will also get to hold to hold the same segment's data.
 //
-// You are probably going to be using a non-scalar type for the ring tokens (because you usually want at least 2^128 possible tokens, and so
-// you want a nice struct that will represent those).
-// To do so:
-// You should provide template definitions for your own non-strandard token_t types like so:
-// template<>
-// static inline int8_t TrivialCmp<my_token_t>(const my_token_t &a, const my_token_t &b) { .. }
-//
-// and you should do the same for the minimum possible value for my_token_t like so:
-// namespace std { template<> struct numeric_limits<my_token_t> { static const my_token_t min() { ... } }; }
-// and you should likely need to do the same for std::min() and std::max() type specific implementations.
+// Please see README.md for how to properly support complex token types.
 #pragma once
 #include <stdint.h>
 #include <vector>
