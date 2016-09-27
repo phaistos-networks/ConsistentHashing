@@ -12,34 +12,22 @@
 //
 // You should operate on ring segments, and for a typical distributed service, each segment will be owned by a primary replica, and based on
 // replication strategies and factors, more(usually, the successor) segments will also get to hold to hold the same segment's data.
-//
-// Please see README.md for how to properly support complex token types.
 #pragma once
-#include <stdint.h>
-#include <vector>
-#include <algorithm>
-#include <limits>
+#ifdef HAVE_SWITCH
+#include "switch.h"
+#include "switch_vector.h"
 #include <experimental/optional>
-
-// Default implementation. Maybe a spaceship operator we could overload will make it into C++20?
-template <typename T>
-static inline int8_t TrivialCmp(const T &a, const T &b)
-{
-        return a == b ? 0 : (a < b ? -1 : 1);
-}
+#else
+#include <algorithm>
+#include <experimental/optional>
+#include <limits>
+#include <stdint.h>
+#include <string.h>
+#include <vector>
+#endif
 
 namespace ConsistentHashing
 {
-	namespace
-	{
-		template<typename T>
-		static void push_back_to(std::vector<T> *const out, const T*const values, const size_t cnt)
-                {
-                        for (uint32_t i{0}; i != cnt; ++i)
-                                out->push_back(values[i]);
-                }
-        };
-
         // Returns lowest index where token <= tokens[index]
         // if it returns cnt, use 0 ( because tokens[0] owns ( tokens[cnt - 1], tokens[0] ]
         template <typename T>
@@ -81,11 +69,27 @@ namespace ConsistentHashing
         // A segment in a ring. The segment is responsible(owns) the tokens range
         // (left, right] 	i.e left exlusive, right inclusive
         // whereas left is the token of the predecessor segment and right is the token of this segment
+	// See also: https://en.wikipedia.org/wiki/Circular_segment
         template <typename token_t>
         struct ring_segment
         {
                 token_t left;
                 token_t right;
+
+		uint64_t span() const noexcept
+		{
+			if (wraps())
+			{
+				require (left >= right);
+				return uint64_t(std::numeric_limits<token_t>::max()) - left + right;
+			}
+			else
+			{
+				require(right >= left);
+				return right - left;
+			}
+		}
+
 
                 ring_segment()
                 {
@@ -182,56 +186,158 @@ namespace ConsistentHashing
                         }
                 }
 
-                // For list of wrapped segments sorted by left token ascending, process the list to produce
-                // an equivalent set of ranges, sans the overlapping ranges
-                static void deoverlap(std::vector<ring_segment> *const segments)
+
+                // masks a segment `mask` from a segment `s`, if they intersect, and return 0+ segments
+		//
+		// It is very important that we get this right, otherwise other methods that depend on it will produce crap
+		// returns a pair, where the first is true if the segment was intersected by the mask, false otherwise, and the second
+		// is the number of segments it was partitioned to (can be 0)
+                std::pair<bool, uint8_t> mask(const ring_segment mask, ring_segment *const out) const noexcept
                 {
-                        if (const auto cnt = segments->size())
+                        if (false == intersects(mask))
+                                return {false, 0};
+                        else if (mask.contains(*this))
                         {
-                                const ring_segment *it = segments->data(), *const e = it + cnt;
-                                ring_segment *out = segments->data(), cur = *it++;
-                                const auto MinTokenValue = std::numeric_limits<token_t>::min();
+                                // completely masked
+                                return {true, 0};
+                        }
+                        else
+                        {
+				// partially masked
+                                uint8_t n{0};
 
-                                while (it != e)
+                                if (mask.wraps() || wraps())
+                                        n = mask.difference(*this, out);
+                                else if (mask.right > left)
                                 {
-                                        // If current goes to the end of the ring, we are done
-                                        if (cur.right == MinTokenValue)
-                                        {
-                                                // If one range is the full range, we return only that
-                                                if (cur.left == MinTokenValue)
-                                                {
-                                                        segments->clear();
-                                                        segments->push_back(cur);
-                                                }
-                                                else
-                                                {
-                                                        *out++ = ring_segment(cur.left, MinTokenValue);
-                                                        segments->resize(out - segments->Values());
-                                                }
-                                                return;
-                                        }
+                                        if (mask.left < right && mask.left > left)
+                                                out[n++] = {left, mask.left};
 
-                                        const ring_segment next = *it++;
+                                        if (mask.right < right)
+                                                out[n++] = {mask.right, right};
+                                }
 
-                                        // if the next left is == to the current right, we do not intersect per se, but replacing (A, B] and (B, C] by (A, C] is lefit,
-                                        // and since this avoid special cases, and will result in more optimal segments, we transform here
-                                        if (next.left <= cur.right)
+                                return {true, n};
+                        }
+                }
+
+                static void mask_segments_impl(const ring_segment *it, const ring_segment *const end, const std::vector<ring_segment> &toExclude, std::vector<ring_segment> *const out)
+                {
+                        ring_segment list[2];
+
+                        for (auto i{it}; i != end; ++i)
+                        {
+                                const auto in = *i;
+
+                                for (const auto mask : toExclude)
+                                {
+                                        if (const auto res = in.mask(mask, list); res.first)
                                         {
-                                                // We do overlap
-                                                if (next.right == MinTokenValue || cur.right < next.right)
-                                                {
-                                                        cur.right = next.right;
-                                                }
-                                        }
-                                        else
-                                        {
-                                                *out++ = cur;
-                                                cur = next;
+                                                // OK, either completely or partially masked
+
+						if (res.second)
+	                                                mask_segments_impl(list, list + res.second, toExclude, out);
+
+                                                goto next;
                                         }
                                 }
-                                *out++ = cur;
-                                segments->resize(out - segments->data());
+
+                                out->push_back(in);
+
+                        next:;
                         }
+		
+                }
+
+                static void mask_segments(const ring_segment *it, const ring_segment *const end, const std::vector<ring_segment> &toExclude, std::vector<ring_segment> *const out)
+                {
+                        mask_segments_impl(it, end, toExclude, out);
+                        // Just in case (this is cheap)
+                        sort_and_deoverlap(out);
+                }
+
+                static void mask_segments(const std::vector<ring_segment> &in, const std::vector<ring_segment> &toExclude, std::vector<ring_segment> *const out)
+                {
+                        mask_segments(in.data(), in.data() + in.size(), toExclude, out);
+                }
+
+                static auto mask_segments(const std::vector<ring_segment> &in, const std::vector<ring_segment> &toExclude)
+                {
+                        std::vector<ring_segment> out;
+
+                        mask_segments(in.begin(), in.end(), &out);
+                        return out;
+                }
+
+                // For list of wrapped segments sorted by left token ascending, process the list to produce
+                // an equivalent set of ranges, sans the overlapping ranges
+                // it will also merge together ranges
+                // i.e [(8, 10],(8, 15],(14, 18],(17, 18]] => [ (8, 18] ]
+                //
+                // this will only work if the segments are properly sorted. see sort_and_deoverlap()
+                // This utility method deals with invalid segments as well (e.g you can't really have more than one segments that wrap)
+                static void deoverlap(std::vector<ring_segment> *const segments)
+                {
+                        auto out = segments->data();
+
+			for (auto *it = segments->data(), *const end = it + segments->size(); it != end; )
+                        {
+                                auto s = *it;
+
+                                if (it->right <= it->left)
+                                {
+                                        // This segment wraps
+                                        // deal with e.g [30, 4], [35, 8], [40, 2]
+                                        // that'd be an invalid list of segments(there can only be one wrapping segment), but we 'll deal with it anyway
+                                        const auto wrappedSegmentIt = it;
+
+                                        for (++it; it != end; ++it)
+                                        {
+                                                if (it->right > s.right)
+                                                        s.right = it->right;
+                                        }
+
+                                        // we need to potentially drop some of them segments if the wrapping segment overlaps them
+                                        if (wrappedSegmentIt != (it = segments->data()) && s.right >= it->right)
+                                        {
+                                                s.right = it->right;
+                                                memmove(it, it + 1, (out - it) * sizeof(ring_segment));
+                                                --out;
+                                        }
+
+                                        *out++ = s;
+                                        break;
+                                }
+                                else
+                                {
+                                        for (++it; it != end && ((*it == s) || (it->left >= s.left && s.right > it->left)); ++it)
+                                                s.right = it->right;
+
+                                        if (out == segments->data() || false == out[-1].contains(s))
+                                        {
+                                                // deal with (8, 30],(9, 18]
+                                                *out++ = s;
+                                        }
+                                }
+                        }
+
+                        segments->resize(out - segments->data());
+
+                        if (segments->size() == 1 && segments->back().left == segments->back().right)
+                        {
+                                // spans the whole ring
+                                const auto MinTokenValue = std::numeric_limits<token_t>::min();
+
+                                segments->pop_back();
+                                segments->push_back({MinTokenValue, MinTokenValue});
+                        }
+                }
+
+		// utility method; sorts segments so that deoverlap() can process them
+                static void sort_and_deoverlap(std::vector<ring_segment> *const segments)
+                {
+                        std::sort(segments->begin(), segments->end(), [](const auto &a, const auto &b) { return a.left < b.left || (a.left == b.left && a.right < b.right); });
+                        deoverlap(segments);
                 }
 
                 // Copy of input list, with all segments unwrapped, sorted by left bound, and with overlapping bounds merged
@@ -242,14 +348,10 @@ namespace ConsistentHashing
                         for (uint32_t i{0}; i != segmentsCnt; ++i)
                         {
                                 if (const uint8_t n = segments[i].unwrap(res))
-                                        push_back_to(out, res, n);
+                                        out->push_back(res, n);
                         }
 
-                        std::sort(out->begin(), out->end(), [](const auto &r1, const auto &r2) noexcept {
-                                return r1.left < r2.left;
-                        });
-
-                        deoverlap(out);
+                        sort_and_deoverlap(out);
                 }
 
                 static auto normalize(const ring_segment *const segments, const uint32_t segmentsCnt)
@@ -260,6 +362,7 @@ namespace ConsistentHashing
                         return res;
                 }
 
+		// true iff segment contains the token
                 bool contains(const token_t &token) const noexcept
                 {
                         if (wraps())
@@ -323,6 +426,9 @@ namespace ConsistentHashing
                 //
                 // (12,7)^(5,20) => [(5,7), (12, 20)]
                 // ring_segment(10, 100).intersection(50, 120) => [ ring_segment(50, 100) ]
+		// see also mask()
+		//
+		// this is the result of the logical operation: ((*this) & that)
                 uint8_t intersection(const ring_segment &that, ring_segment *out) const noexcept
                 {
                         if (that.contains(*this))
@@ -351,10 +457,10 @@ namespace ConsistentHashing
                                 }
                                 else if (thisWraps && thatWraps)
                                 {
-                                        // Two wrapping ranges always intersect. 
-					// We have determined that neither this or that contains the other, we are left
+                                        // Two wrapping ranges always intersect.
+                                        // We have determined that neither this or that contains the other, we are left
                                         // with two possibilities and mirror images of each such case:
-                                        // 1. both of s (1,2] endpoints lie in this's (A, B] right semgnet:
+                                        // 1. both of s (1,2] endpoints lie in this's (A, B] right segment
                                         // 2. only that's start endpoint lies in this's right segment:
                                         if (left < that.left)
                                                 return intersection_of_two_wrapping_segments(*this, that, out);
@@ -373,8 +479,16 @@ namespace ConsistentHashing
                 // @out: List of ranges left after subtracting contained from `this` (@return value is size of @out)
                 //
                 // i.e ring_segment(10, 100).subdvide(ring_segment(50, 55)) => [ ring_segment(10, 50), ring_segment(55, 110) ]
+		//
+		// You may want to use mask() instead, which is more powerful and covers wrapping cases, etc
                 uint8_t subdivide(const ring_segment &contained, ring_segment *const out) const noexcept
                 {
+			if (contained.contains(*this))
+			{
+				// contained actually contains this segment
+				return 0;
+			}
+
                         uint8_t size{0};
 
                         if (left != contained.left)
@@ -384,10 +498,10 @@ namespace ConsistentHashing
                         return size;
                 }
 
-		// if this segment wraps, it will return two segments
-		// 1. (left, std::numeric_limits<token_t>::min())
-		// 2. (std::numeric_limits<token_t>::min(), right)
-		// otherwise, it will return itself
+                // if this segment wraps, it will return two segments
+                // 1. (left, std::numeric_limits<token_t>::min())
+                // 2. (std::numeric_limits<token_t>::min(), right)
+                // otherwise, it will return itself
                 uint8_t unwrap(ring_segment *const out) const noexcept
                 {
                         const auto MinTokenValue = std::numeric_limits<token_t>::min();
@@ -411,6 +525,9 @@ namespace ConsistentHashing
                 // e.g segment(18, 25).difference(segment(5,20)) => [ (5, 18) ]
                 //
                 // In other words, compute the missing segments(ranges) that (*this) is missing from rhs
+		// There is an opposite operation, mask()
+		//
+		// This is the result of the logical operation: (rhs & (~(rhs & (*this))) )
                 uint8_t difference(const ring_segment &rhs, ring_segment *const result) const
                 {
                         ring_segment intersectionSet[2];
@@ -449,72 +566,61 @@ namespace ConsistentHashing
                         return {{ring_segment(left, segmentToken), ring_segment(segmentToken, right)}};
                 }
 
-
-		// Two handy utility methods for checking if a token is in 0+ segments
-                static bool token_in_any_segments(const token_t token, const std::vector<ring_segment> &segments)
+#ifdef HAVE_SWITCH
+                void serialize(IOBuffer *const b) const
                 {
-                        const auto *const r = segments.data();
-                        const auto n = segments.size();
+                        b->Serialize(left);
+                        b->Serialize(right);
+                }
 
-                        switch (n)
+                void deserialize(ISerializer *const b) const
+                {
+                        b->Unserialize<token_t>(&left);
+                        b->Unserialize<token_t>(&right);
+                }
+#endif
+
+		// Make sure segments is properly ordered and deoverlapped
+		// see sort_and_deoverlap()
+		static bool segments_contain(const token_t token, const ring_segment *const segments, const uint32_t cnt)
+                {
+                        if (!cnt)
+                                return false;
+
+                        int32_t h = cnt - 1;
+
+                        if (segments[h].wraps())
                         {
-                                case 4:
-                                        if (r[3].contains(token))
-                                                return true;
-                                case 3:
-                                        if (r[2].contains(token))
-                                                return true;
-                                case 2:
-                                        if (r[1].contains(token))
-                                                return true;
-                                case 1:
-                                        if (r[0].contains(token))
-                                                return true;
-                                case 0:
-                                        break;
+                                if (segments[h--].contains(token))
+                                {
+                                        // there can only be one segment that wraps, and that should be the last one (see sort_and_deoverlap() impl.)
+                                        return true;
+                                }
+                        }
 
-                                default:
-                                        for (uint32_t i{0}; i != n; ++i)
-                                        {
-                                                if (r[i].contains(token))
-                                                        return true;
-                                        }
-                                        break;
+                        for (int32_t l{0}; l <= h;)
+                        {
+                                const auto m = (l & h) + ((l ^ h) >> 1);
+                                const auto segment = segments[m];
+
+                                if (segment.contains(token))
+                                        return true;
+                                else if (token <= segment.left)
+                                        h = m - 1;
+                                else
+                                        l = m + 1;
                         }
 
                         return false;
                 }
-
-		// if input segments are ordered, you should consider using this method instead
-                static bool token_in_any_ordered_segments_with_base(const token_t token, const std::vector<ring_segment> &segments, uint32_t &base)
-                {
-                        const auto *const all = segments.data();
-                        const auto cnt = segments.size();
-
-                        if (base == 0 && token < all[0].left && all[cnt - 1].wraps())
-                                return token <= all[cnt - 1].right;
-                        else
-                        {
-                                for (uint32_t i = base; i < cnt; ++i)
-                                {
-                                        if (token > all[i].right)
-                                                ++base;
-                                        else
-                                                return all[i].contains(token);
-                                }
-
-                                return false;
-                        }
-                }
         };
 
-
-	// A Ring of tokens
+        // A Ring of tokens
         template <typename T>
         struct Ring
         {
                 using token_t = T;
-		using segment_t = ring_segment<T>;
+                using segment_t = ring_segment<T>;
 
                 const T *const tokens;
                 const uint32_t cnt;
@@ -584,15 +690,19 @@ namespace ConsistentHashing
                         return tokens[(idx + 1) % cnt];
                 }
 
+                auto index_segment(const uint32_t idx) const noexcept
+                {
+                        return ring_segment<T>(tokens[(idx + (cnt - 1)) % cnt], tokens[idx]);
+                }
+
                 // segment in the ring that owns this token
                 // based on the (prev segment.token, this segment.token] ownership rule
                 auto token_segment(const T token) const noexcept
                 {
-                        const auto idx = index_of(token);
-
-                        return ring_segment<T>(tokens[(idx + (cnt - 1)) % cnt], tokens[idx]);
+                        return index_segment(index_of(token));
                 }
 
+		// see also sort_and_deoverlap()
                 void segments(std::vector<ring_segment<T>> *const res) const
                 {
                         if (cnt)
@@ -612,57 +722,117 @@ namespace ConsistentHashing
                         return res;
                 }
 
-		// Assuming a node is a replica for tokens in segments `current`, and then the segments is is a replica for
-		// change to `updated`. 
-		//
-		// This handy utility method will generate a pair of segments list. 
-		// The first is segments the node will need to *fetch* from other nodes in the ring, because it will now be also responsible
-		// for those segments, but it does not have the data.
-		// The second is segments the node will need to *stream* to other nodes in the ring, because it will no longer hold data for them.
-		//
-		// Obviously, if a node is just introduced to a ring (i.e have only updated and no current segments ), it should
-		// just fetch data for all the current segments. Conversely, if the node is exiting the ring, it should
-		// consider streaming all the data it has to other nodes if needed, and not fetch any data to itself.
-		static auto compute_segments_ownership_updates(const std::vector<segment_t> &current, const std::vector<segment_t> &updated)
+                // Assuming a node is a replica for tokens in segments `current`, and then it assumes ownership of a different
+		// set of segments, `updated`
+                //
+                // This handy utility method will generate a pair of segments list:
+                // 1. The first is segments the node will need to *fetch* from other nodes in the ring, because it will now be also responsible
+                // for those segments, but it does not have the data, based on the current owned segments.
+                // 2. The second is segments the node will need to *stream* to other nodes in the ring, because it will no longer hold data for them.
+                //
+                // Obviously, if a node is just introduced to a ring (i.e have only updated and no current segments ), it should
+                // just fetch data for all the current segments. Conversely, if the node is exiting the ring, it should
+                // consider streaming all the data it has to other nodes if needed, and not fetch any data to itself.
+                //
+                // make sure that current and updated are in order  e.g std::sort(start, end, [](const auto &a, const auto &b) { return a.left < b.left; });
+                //
+                // Because the output will be an array of segments (_not_ tokens), you will need to determine the segments of the ring that intersect it
+                // in order to figure out which nodes have which parts of the segments.
+                //
+                // This is a fairly expensive method (although it should be easy to optimize it if necessary), but given how rare it should be used, that's not a real concern
+                static auto compute_segments_ownership_updates(const std::vector<segment_t> &currentSegmentsInput, const std::vector<segment_t> &updatedSegmentsInput)
                 {
-			std::vector<segment_t> toFetch, toStream;
+                        std::vector<segment_t> toFetch, toStream, current, updated, toFetchFinal, toStreamFinal;
                         segment_t segmentsList[2];
 
-			for (const auto curSegment : current)
-                        {
-                                bool intersect{false};
+                        // We need to work on normalized lists of segments
+                        current = currentSegmentsInput;
+                        ring_segment<T>::sort_and_deoverlap(&current);
 
-				for (const auto updatedSegment : updated)
+                        updated = updatedSegmentsInput;
+                        ring_segment<T>::sort_and_deoverlap(&updated);
+
+                        for (const auto curSegment : current)
+                        {
+                                const auto n = toStream.size();
+
+                                for (const auto updatedSegment : updated)
                                 {
                                         if (curSegment.intersects(updatedSegment))
-                                        {
-                                                push_back_to(&toStream, segmentsList, updatedSegment.difference(curSegment, segmentsList));
-                                                intersect = true;
-                                        }
+                                                toStream.insert(toStream.end(), segmentsList, segmentsList + updatedSegment.difference(curSegment, segmentsList));
                                 }
 
-                                if (!intersect)
-                                        toStream.push_back(curSegment); 
+                                if (toStream.size() == n)
+                                {
+                                        // no intersection; accept whole segment
+                                        toStream.push_back(curSegment);
+                                }
                         }
 
-			for (const auto updatedSegment : updated)
+                        for (const auto updatedSegment : updated)
                         {
-                                bool intersect{false};
+                                const auto n = toFetch.size();
 
-				for (const auto curSegment : current)
+                                for (const auto curSegment : current)
                                 {
                                         if (updatedSegment.intersects(curSegment))
-                                        {
-                                                push_back_to(&toFetch, segmentsList, curSegment.difference(updatedSegment, segmentsList));
-                                                intersect = true;
-                                        }
+                                                toFetch.insert(toFetch.end(), segmentsList, segmentsList + curSegment.difference(updatedSegment, segmentsList));
                                 }
 
-                                if (!intersect)
+                                if (toFetch.size() == n)
+                                {
+                                        // no intersection; accept whole segment
                                         toFetch.push_back(updatedSegment);
+                                }
                         }
 
-			return std::make_pair(toFetch, toStream);
+                        // normalize output
+                        ring_segment<T>::sort_and_deoverlap(&toFetch);
+                        ring_segment<T>::sort_and_deoverlap(&toStream);
+
+                        // mask segments:
+                        // 	from segments to fetch, mask currently owned segments
+                        //	from segments to stream, mask segments we will own (updated segments)
+                        ring_segment<T>::mask_segments(toFetch, current, &toFetchFinal);
+                        ring_segment<T>::mask_segments(toStream, updated, &toStreamFinal);
+
+                        return std::make_pair(toFetchFinal, toStreamFinal);
                 }
+
+		// When a node acquires ring tokens, it only disupts segments its token(s) fall into
+		// Assuming a ring of tokens:  (10, 100, 150, 180, 200)
+		// and a node joins a cluster, and acquires token 120
+		// then it will only affect requests for (100, 120]
+		// so it will need to fetch content for (100, 120] from somewhere. Where? well, from whichever owned (100, 150]
+		// which is just the successor node, which we can find using index_owner_of()
+		// This is a simple replication strategy implementation; we 'll just walk the ring clockwise and collect nodes that own
+		// the tokens, skipping already collected nodes
+		template<typename L>
+		auto token_replicas_basic(const token_t token, const uint8_t replicationFactor, L &&endpoint_token) const
+                {
+                        using node_t = typename std::result_of<L(uint32_t)>::type;
+                        std::vector<node_t> nodes;
+                        const auto base = index_owner_of(token);
+                        auto idx = base;
+
+                        do
+                        {
+                                const auto node = endpoint_token(idx);
+
+                                if (std::find(nodes.begin(), nodes.end(), node) == nodes.end())
+                                {
+                                        nodes.push_back(node);
+                                        if (nodes.size() == replicationFactor)
+                                                break;
+                                }
+
+                                idx = (idx + 1) % size();
+                        } while (idx != base);
+
+                        return nodes;
+                }
+
+		// When a node leaves the ring, then we will need to consider the replication factor, and strategy, which usually
+		// requires copying data around so that we 'll have, e.g x3 copies of the same value.
         };
 }
