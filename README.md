@@ -47,13 +47,139 @@ namespace std
 	{
 		// return whichever is higher 
 	}
-};
+}
 ```
 
 - Finally, you should implement appropriate `operator==`, `operator!=`, `operator<` and `operator>` methods for your hugetoken_t
 
 This is really not that much work, and chances are you are already doing that anyway to support other needs of your codebase.
 
+### Example
+
+```cpp
+#include <consistent_hashing.h>
+
+int main()
+{
+        using token_t = uint32_t;
+        using segment_t = ConsistentHashing::ring_segment<token_t>;
+        using ring_t = ConsistentHashing::Ring<token_t>;
+        using node_t = uint32_t;
+        // Suppose we have a simple ring, and of those tokens, only
+        // one is owned by the node we wish to update (node 1)
+        std::pair<node_t, token_t> ringStructure[] =
+            {
+                {100, 10},
+                {200, 20},
+                {300, 30},
+                {400, 40},
+                {500, 50},
+                {600, 60},
+                {1, 70}, /* this is the only token owned by node 1 */
+                {800, 80},
+                {900, 90},
+                {1000, 100},
+                {150, 110},
+                {1200, 120}};
+        std::vector<token_t> nodeTokensNow, nodeTokensFuture{35, 95};
+        std::vector<node_t> ringTokensNodes, ringTokens;
+
+        // We need all ring tokens, and all associated nodes for those tokens.
+        // We also need to collect the tokens owned by the node
+        for (auto it = std::begin(ringStructure), end = std::end(ringStructure); it != end; ++it)
+        {
+                const auto &v = *it;
+
+                if (v.first == 1)
+                        nodeTokensNow.push_back(v.second);
+
+                ringTokens.push_back(v.second);
+                ringTokensNodes.push_back(v.first);
+        }
+
+        // This is a simple method that returns the replicas for a given token
+        // In practice, you wouldn't allocate any memory here (i.e no std::vector<> use), you 'd
+        // pay a lot of attention to performance, and you 'd possiblyh consider physical placement of node
+        // (i.e at least one from local DC and the rest from other DCs)
+        const auto replicas_of = [](const auto &ring, const auto ringTokensNodes, const token_t token) {
+                std::vector<node_t> res;
+                static constexpr uint8_t replicationFactor{2}; // how many copies of each ring segment we need at any given time
+                const auto base = ring.index_owner_of(token);  // index in the ring tokens for the token-owner of token(input)
+                uint32_t i{base};
+
+                // walk the the ring clockwise until we have enough nodes to return
+                do
+                {
+                        const auto node = ringTokensNodes[i];
+
+                        if (std::find(res.begin(), res.end(), node) == res.end())
+                        {
+                                // haven't collected that node yet
+                                // we only care for distinct nodes
+                                res.push_back(node);
+                                if (res.size() == replicationFactor)
+                                        break;
+                        }
+
+                        i = (i + 1) % ring.size();
+                } while (i != base);
+
+                return res;
+        };
+
+        // This is our ring
+        const ring_t ring(ringTokens.data(), ringTokens.size());
+        // Figure out what needs to be transfered, the available sources for those segments, and the targets
+        auto res = ring.transition(ringTokensNodes.data(), node_t(1), nodeTokensFuture, replicas_of);
+        std::vector<decltype(res)> transfers;
+
+        transfers.push_back(std::move(res));
+        // If we wanted to do this for multiple nodes (e.g you want to add 5 more new nodes)
+        // then you should execute transition() for each of those nodes, and append those into transfers[]
+        for (const auto &ctx : transfers)
+        {
+                for (auto &it : ctx)
+                {
+                        auto segment = it.first;
+                        auto &fromTo = it.second;
+                        auto &sources = fromTo.first;
+                        auto &targets = fromTo.second;
+
+                        // This function will consider the distance in terms of e.g network hops
+                        // from the local node to each node in sources[], and it will
+                        // filter it by keeping only the nodes that are closest to this local node
+                        //
+                        // This is important because we want to minimize the time it will take to transfered
+                        // data among ring nodes.
+                        //
+                        filter_by_distance_from_local(sources);
+                }
+        }
+
+        // This function should consider all sources, consider opportunities for fairly scheduling of transfers
+        // across the distinct sources, and otherwise do what it takes to transfer data among nodes
+        //
+        // One way to do this is to register a new "transfer session", and coordinate the process among all
+        // ring nodes involved. In case of failure, the participating nodes should also abort.
+        // You should also make sure that only one transfer is active at any given time.
+        //
+        // Eventually, the callback should be invoked, and that callback
+        // should create a new final ring
+
+        schedule_transfer(std::move(transfers),
+                          [ tokensNow = std::move(nodeTokensNow), tokensFuture = std::move(nodeTokensFuture) ]{
+                              // This is the success callback.
+                              //
+                              // we should:
+                              // 1. create a new ring tokens list, that excludes tokensNow and includes tokensFuture
+                              // 2. we should create a new ring from those tokens
+                              // 3. we should assign the token tokensFuture
+                              // 4. we should set that new ring as the current ring, and gossip to the cluster about the update
+
+                          });
+        return 0;
+}
+```
 --
 
 With the included data structures and implemented algorithms, it should be trivial to build robust consistent-hashing based replication for your distributed systems.
