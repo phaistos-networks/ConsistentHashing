@@ -255,6 +255,8 @@ namespace ConsistentHashing
                                 // Just in case (this is cheap)
                                 sort_and_deoverlap(out);
                         }
+                        else
+                                out->insert(out->end(), it, end);
                 }
 
                 static void mask_segments(const std::vector<ring_segment> &in, const std::vector<ring_segment> &toExclude, std::vector<ring_segment> *const out)
@@ -783,7 +785,6 @@ namespace ConsistentHashing
                         updated = updatedSegmentsInput;
                         ring_segment<T>::sort_and_deoverlap(&updated);
 
-
                         for (const auto curSegment : current)
                         {
                                 const auto n = toStream.size();
@@ -822,13 +823,11 @@ namespace ConsistentHashing
                         ring_segment<T>::sort_and_deoverlap(&toFetch);
                         ring_segment<T>::sort_and_deoverlap(&toStream);
 
-
                         // mask segments:
                         // 	from segments to fetch, mask currently owned segments
                         //	from segments to stream, mask segments we will own (updated segments)
                         ring_segment<T>::mask_segments(toFetch, current, &toFetchFinal);
                         ring_segment<T>::mask_segments(toStream, updated, &toStreamFinal);
-
 
                         return std::make_pair(toFetchFinal, toStreamFinal);
                 }
@@ -868,132 +867,324 @@ namespace ConsistentHashing
                         return nodes;
                 }
 
-                // EXAMPLE: This is an example for illustrative purproses, and it's used for transition(), which is also here for illustrative piurproses.
-                // Do not use it in production :-)
-                // EXAMPLE: This implementation illustrates how you could do that:
+                // This generates the lists of tokens and matching nodes that own them based on a new ownership state that results
+                // from applying the changes in ringTokensNodes
+                // Specifically, in the resulted topology, current nodes tokens are replaced with their updated set in ringTokensNodes
                 template <typename node_t>
-                auto replicas_of(const token_t token) const
+                std::pair<std::vector<token_t>, std::vector<node_t>> new_topology(const node_t *const ringTokensNodes,
+                                                                                        const std::unordered_map<node_t, std::vector<token_t>> &futureNodesTokens) const
                 {
-                        return token_replicas_basic(token, 2, [tokens = tokens](const uint32_t idx)->uint32_t {
-                                const auto token = tokens[idx];
-
-                                return token / 10;
-                        });
-                }
-
-
-
-		// With every transition of a single node, we will be potentially reducing or increasing the replication count of some data
-		// by 1. That is, we can not do decrease or increasy by another factor.
-		//
-		// For however many nodes you want to add, remove, or update in a cluster, you need to call transition() for it, and
-		// In the end, you should consider all transitions (ring segment data from SOURCEs to TARGETs). You should
-		// make sure that your source lists are filtered, so that only the local, or otherwise closest to the targets, so that
-		// the network cost and time for the transfers is minimized.
-		// You will then need to come up with a fair assignment of targets to sources.
-		//
-		// This is not optimized by design; because it's rarely going to be used, and because we need to make it easy to figure out what's going on, we are
-		// giving up some performance for clarity and simplicity
-                template <typename node_t, typename L>
-                auto transition(
-                    const node_t *const ringTokensNodes,            /* one node / token for all tokens of this ring */
-                    const node_t node,                              /* node we are working on */
-                    const std::vector<token_t> futureNodeTokens, /* tokens the node will own after the transition */
-                    L &&replicas_for /* returns the nodes that are replicas for a token */) const
-                {
-                        const auto segments_of = [&replicas_for](const Ring &ring, const node_t *const ringTokensNodes, const node_t node) {
-                                std::vector<ring_segment<T>> res;
-
-                                for (uint32_t i{0}; i != ring.cnt; ++i)
-                                {
-                                        const auto token = ring.tokens[i];
-                                        const auto replicas = replicas_for(ring, ringTokensNodes, token);
-
-                                        if (std::find(replicas.begin(), replicas.end(), node) != replicas.end())
-                                                res.push_back({ring.token_predecessor_by_index(i), token});
-                                }
-
-                                std::sort(res.begin(), res.end(), [](const auto &a, const auto &b) { return a.left < b.left; });
-                                return res;
-                        };
-
                         std::vector<token_t> transientRingTokens;
-                        std::unordered_map<token_t, node_t> map;
-                        std::vector<std::pair<segment_t, std::pair<std::vector<node_t>, std::vector<node_t>>>> transportMap;
                         std::vector<node_t> transientRingTokensNodes;
-                        // Which segments is the node a replica for currently?
-                        const auto replicaForSegmentsNow = segments_of(*this, ringTokensNodes, node);
+                        std::unordered_map<token_t, node_t> map;
 
-                        // We need a transient ring, where the node's current tokens are replaced
-                        // with its future tokens.
                         for (uint32_t i{0}; i != cnt; ++i)
                         {
-                                auto it = replicaForSegmentsNow.begin(), end = replicaForSegmentsNow.end();
                                 const auto token = tokens[i];
 
-                                if (ringTokensNodes[i] != node)
+                                if (futureNodesTokens.find(ringTokensNodes[i]) == futureNodesTokens.end())
                                 {
                                         transientRingTokens.push_back(tokens[i]);
                                         map.insert({tokens[i], ringTokensNodes[i]});
                                 }
                         }
 
-                        for (const auto it : futureNodeTokens)
-                                map.insert({it, node});
-
-                        transientRingTokens.insert(transientRingTokens.end(), futureNodeTokens.begin(), futureNodeTokens.end());
-                        std::sort(transientRingTokens.begin(), transientRingTokens.end());
-
-                        transientRingTokensNodes.reserve(map.size());
-                        for (const auto it : transientRingTokens)
-                                transientRingTokensNodes.push_back(map[it]);
-
-                        const Ring transientRing(transientRingTokens);
-
-                        // We now have a transient ring that represents the final state, with the
-                        // current node tokens replaced with the final tokens, and we also have
-                        // an array that holds the node/owner for each token in the transient ring
-
-                        // Determine the segments the node will serve(will be a replica of) based on the transient ring
-                        const auto replicaForSegmentsFuture = segments_of(transientRing, transientRingTokensNodes.data(), node);
-                        // Figure out which segments need to be fetched to the node, and which to be transfered to other nodes
-                        // in order to comply with the replication semantics
-                        const auto res = compute_segments_ownership_updates(replicaForSegmentsNow, replicaForSegmentsFuture);
-                        const auto &toFetch = res.first, &toStream = res.second;
-                        std::vector<node_t> diff;
-
-                        for (const auto segment : toFetch)
+                        for (const auto &it : futureNodesTokens)
                         {
-                                // Current sources for this segment
-                                auto srcReplicas = replicas_for(*this, ringTokensNodes, segment.right);
-                                // The destination is this node
-                                const auto dest = node;
+                                const auto node = it.first;
 
-                                transportMap.push_back({segment, {std::move(srcReplicas), {dest}}});
+                                transientRingTokens.insert(transientRingTokens.end(), it.second.data(), it.second.data() + it.second.size());
+                                for (const auto token : it.second)
+                                        map.insert({token, node});
                         }
 
-                        for (const auto segment : toStream)
+                        std::sort(transientRingTokens.begin(), transientRingTokens.end());
+
+                        // The associated nodes for each token in the transient ring
+                        transientRingTokensNodes.reserve(transientRingTokens.size());
+                        for (const auto token : transientRingTokens)
+                                transientRingTokensNodes.push_back(map[token]);
+
+                        return {std::move(transientRingTokens), std::move(transientRingTokensNodes)};
+                }
+
+                template <typename node_t, typename L>
+                static node_t *filter_by_distance(node_t *const nodes, const node_t *const end, L &&l)
+                {
+                        using dist_t = typename std::result_of<L(node_t)>::type;
+                        dist_t min;
+                        uint32_t out{0};
+
+                        for (auto it = nodes; it != end; ++it)
                         {
-                                // Current sources for this segment
-                                auto srcReplicas = replicas_for(*this, ringTokensNodes, segment.right);
-                                // Targets, in the transient ring.
-                                auto destReplicas = replicas_for(transientRing, transientRingTokensNodes.data(), segment.right);
-
-                                // Make sure that current sources are excluded from the targets
-                                std::sort(srcReplicas.begin(), srcReplicas.end());
-                                std::sort(destReplicas.begin(), destReplicas.end());
-                                diff.clear();
-                                std::set_difference(destReplicas.begin(), destReplicas.end(), srcReplicas.begin(), srcReplicas.end(), std::back_inserter(diff));
-
-                                if (diff.size())
+                                if (!out)
                                 {
-                                        // Only if it makes sense
-                                        transportMap.push_back({segment, {std::move(srcReplicas), std::move(diff)}});
+                                        min = l(*it);
+                                        nodes[out++] = *it;
+                                }
+                                else if (const auto d = l(*it); d == min)
+                                        nodes[out++] = *it;
+                                else if (d < min)
+                                {
+                                        min = d;
+                                        nodes[0] = *it;
+                                        out = 1;
                                 }
                         }
 
-                        // It is important to filter the sources by distance, so that e.g we only
-                        // consider the local DC nodes, if there are any, and then further sort them by load.
+                        return nodes + out;
+                }
+
+
+                // Whenever one more nodes alters the ring topology (when joining a cluster, leaving a cluster, or acquiring a different set of tokens), we need to
+                // account for that change, by copying data to nodes that will serve segments they didn't already were serving(thus, they don't have the data for that ring space)
+                // and by copying data to nodes that will now serve as a result of one or more nodes dropping segments they used to serve. This is necessary in order to
+                // support replication semantics.
+                //
+                // You should initiate a transition, and when it is complete, create the final ring topology using
+                // new_topology() like it's used here for the transient ring, and switch to it, by advertising the new tokens for all tokens in the ring.
+                //
+                // GUIDELINES
+                // - There can be only one active transition in progress. If you allow for concurrent transitions, you will almost definitely end up with
+                // invalid rings that likely contain missing data.
+                // - For existing nodes participating in the transition: They should not be stopped or otherwise be treated in any special way.
+                // - For nodes that are to join the cluster(i.e are not already participating in the ring), you should wait until the transition has completed successfully,
+                // 	and then initialize them with the tokens you used for them in the transition.
+                // - For nodes that are to leave the cluster(i.e notes in the current cluster, but not in the cluster topology after the transition), you should
+                //	wait until the transition has completed successfully, and them stop them, and make sure you won't start them again with the same tokens.
+                //
+                // With this method, the only tricky operation becomes the coordindation required for switching to the new topology after the
+                // streaming required for the transition is complete. You will need to (re)start nodes using specific tokens, etc.
+                //
+                // OPTIMIZATION OPPORTUNITIES
+                // - You should use filter_by_distance() to filter sources, or a similar function so that you will always select among the closest(in terms of network hops) nodes to
+                // the ring target node for streaming, in order to minimize streaming time.
+                // - You should try to schedule the streaming operations fairly among the involved nodes. If you over-load a node and under-load the rest, or vice versa, the time
+                // and effort(cost) will be much higher.
+                //
+                // EXAMPLES
+                // - If you 'd like to add 5 new nodes to your cluster, you can pick appropriate tokens(functionality for selecting tokens from the ring based on current distribution will be
+                // implemented later) for those new tokens, initiate a transition that involves them and their new tokens, and when you are done streaming, you should start those new 5 nodes, and each
+                // should be conigured to use the tokens you selected for transition().
+                // - If you 'd like to decomission 1 node, you just need to a new transition that involves that node, and the list of tokens it will own will be empty. Once the streaming is
+                // complete, you should stop the node.
+		//
+		// MISC
+		// Maybe it's a good idea to get all nodes accept all writes for the segments they serve, even if the transition hasn't been completed, so that you won't need
+		// read-repair to deal with missing content. While the streaming is in-progress, writes for segments served by involved segments that they didn't already serve
+		// in the current ring, will be lost - unless your service can support a mode where all writes eventually will be forwarded to those nodes, either by using some
+		// sort of hinted-handoff system, or by having those nodes in the ring but only responding for reads for the current segments, and writes should get a diff. strategy.
+		// This section will be eventually revised with more concrete advise on how to do about this.
+                template <typename node_t, typename L>
+                auto transition(
+                    const node_t *const ringTokensNodes,
+                    const std::unordered_map<node_t, std::vector<token_t>> &futureNodesTokens,
+                    L &&replicas_for) const
+                {
+                        static constexpr size_t maxReplicasCnt{16};
+                        const auto segments_of = [&replicas_for](const Ring &ring, const node_t *const ringTokensNodes, const node_t node, std::vector<segment_t> *const res) {
+                                node_t replicas[maxReplicasCnt];
+
+                                for (uint32_t i{0}; i != ring.cnt; ++i)
+                                {
+                                        const auto token = ring.tokens[i];
+                                        const auto replicasCnt = replicas_for(ring, ringTokensNodes, token, replicas);
+
+                                        if (std::find(replicas, replicas + replicasCnt, node) != replicas + replicasCnt)
+                                                res->push_back({ring.token_predecessor_by_index(i), token});
+                                }
+
+                                std::sort(res->begin(), res->end(), [](const auto &a, const auto &b) { return a.left < b.left; });
+                        };
+
+                        const auto transientRingTopology = new_topology(ringTokensNodes, futureNodesTokens);
+                        const auto &transientRingTokens = transientRingTopology.first;
+                        const auto &transientRingTokensNodes = transientRingTopology.second;
+                        const Ring transientRing(transientRingTokens.data(), transientRingTokens.size());
+                        const auto transientRingSegments = transientRing.segments();
+                        const auto currentRingSegments = segments();
+                        std::vector<segment_t> outSegments;
+                        segment_t segmentsList[2];
+                        std::vector<std::pair<segment_t, std::pair<node_t, std::vector<node_t>>>> transportMap;
+                        std::unordered_map<node_t, std::vector<segment_t>> curRingServeMap;
+                        std::vector<node_t> replicas;
+                        node_t tokenReplicas[maxReplicasCnt], futureReplicas[maxReplicasCnt];
+			std::vector<segment_t> replicaForSegmentsFuture, replicaForSegmentsNow;
+
+                        // Build (node => [segments]) map for the current ring
+                        {
+                                std::vector<std::pair<node_t, segment_t>> v;
+
+                                for (const auto segment : currentRingSegments)
+                                {
+                                        const auto n = replicas_for(*this, ringTokensNodes, segment.right, tokenReplicas);
+
+                                        for (uint8_t i{0}; i != n; ++i)
+                                                v.push_back({tokenReplicas[i], segment});
+                                }
+
+                                std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+
+                                const auto n = v.size();
+                                const auto all = v.data();
+
+                                for (uint32_t i{0}; i != n;)
+                                {
+                                        const auto node = v[i].first;
+                                        std::vector<segment_t> list;
+
+                                        do
+                                        {
+                                                list.push_back(v[i].second);
+                                        } while (++i != n && v[i].first == node);
+
+                                        curRingServeMap.insert({node, std::move(list)});
+                                }
+                        }
+
+                        for (const auto &it : futureNodesTokens)
+                        {
+                                const auto node = it.first;
+
+				replicaForSegmentsFuture.clear();
+				replicaForSegmentsNow.clear();
+
+                                segments_of(transientRing, transientRingTokensNodes.data(), node, &replicaForSegmentsFuture);
+                                segments_of(*this, ringTokensNodes, node, &replicaForSegmentsNow);
+
+                                // Compute what needs to be delivered to _this_ node
+                                for (const auto futureSegment : replicaForSegmentsFuture)
+                                {
+                                        //  Mask segments this node serves already, no need to acquire any content we already have
+					const auto futureSegmentWraps = futureSegment.wraps();
+                                        outSegments.clear();
+                                        segment_t::mask_segments(&futureSegment, (&futureSegment) + 1, replicaForSegmentsNow, &outSegments);
+
+
+                                        if (outSegments.empty())
+                                        {
+                                                // No need to acquire extra data
+                                                continue;
+                                        }
+
+					// TODO: use binary search to locate the next segment in currentRingSegments
+					// No need for the linear scan
+
+
+                                        // OK, so who's going to provide content for those segments, based on the current ring?
+                                        for (const auto it : currentRingSegments)
+                                        {
+						if (it.right <= futureSegment.left)
+						{
+							// can safely skip it
+							continue;
+						}
+						else if (it.left > futureSegment.right && !futureSegmentWraps && !it.wraps())
+						{
+							// can safely stop here
+							break;
+						}
+
+                                                const auto cnt = it.intersection(futureSegment, segmentsList);
+
+                                                if (!cnt)
+                                                        continue;
+
+                                                const std::vector<node_t> replicas(tokenReplicas, tokenReplicas + replicas_for(*this, ringTokensNodes, it.right, tokenReplicas));
+
+                                                for (uint8_t i{0}; i != cnt; ++i)
+                                                        transportMap.push_back({segmentsList[i], {node, replicas}}); // from replicas, to node, that segment
+                                        }
+                                }
+
+                                // Whenever a node gives up (part of) a ring segment, we need to shift data around in order
+                                // to account for the fact that replication factor for the data that span that segment will drop by 1.
+                                for (const auto currentSegment : replicaForSegmentsNow)
+                                {
+                                        const auto token = currentSegment.right;
+					const auto currentSegmentWraps = currentSegment.wraps();
+                                        bool haveSources{false};
+
+					// TODO: use binary search to locate the next segment in transientRingSegments
+					// No need for linear scan
+
+                                        for (const auto futureSegment : transientRingSegments)
+                                        {
+						if (futureSegment.right <= currentSegment.left)
+						{
+							// can safely skip it
+							continue;
+						}
+						else if (futureSegment.left > currentSegment.right && !currentSegmentWraps && !futureSegment.wraps())
+						{
+							// can safely stop here
+							break;
+						}
+
+                                                const auto cnt = futureSegment.intersection(currentSegment, segmentsList);
+
+                                                if (!cnt)
+                                                        continue;
+
+                                                const auto futureReplicasCnt = std::remove_if(futureReplicas,
+                                                                                              futureReplicas + replicas_for(transientRing, transientRingTokensNodes.data(), futureSegment.right, futureReplicas),
+                                                                                              [node, &futureNodesTokens](const node_t target) {
+                                                                                                      if (target == node)
+                                                                                                      {
+                                                                                                              // exclude self
+                                                                                                              return true;
+                                                                                                      }
+                                                                                                      else if (futureNodesTokens.find(target) != futureNodesTokens.end())
+                                                                                                      {
+                                                                                                              // exclude nodes that are also involved in this process, otherwise we may output the same value twice in transportMap
+                                                                                                              return true;
+                                                                                                      }
+                                                                                                      else
+                                                                                                      {
+                                                                                                              return false;
+                                                                                                      }
+
+                                                                                              }) -
+                                                                               futureReplicas;
+
+                                                for (uint8_t i{0}; i != cnt; ++i)
+                                                {
+                                                        const auto subSegment = segmentsList[i]; // intersection
+
+							for (uint32_t ri{0}; ri != futureReplicasCnt; ++ri)
+                                                        {
+                                                                const auto target = futureReplicas[ri];
+
+                                                                if (!haveSources)
+                                                                {
+                                                                        // lazy generation of the sources(replicas) for this segment
+                                                                        // replicas should include this node
+                                                                        replicas.clear();
+                                                                        replicas.insert(replicas.end(), tokenReplicas, tokenReplicas + replicas_for(*this, ringTokensNodes, token, tokenReplicas));
+                                                                        haveSources = true;
+                                                                }
+
+                                                                if (auto s = curRingServeMap.find(target); s != curRingServeMap.end())
+                                                                {
+                                                                        // this node serves 1+ segments already in the current segment
+                                                                        // mask subSegment with them; we don't want to send data to nodes if they already have any of it
+                                                                        outSegments.clear();
+                                                                        segment_t::mask_segments(&subSegment, (&subSegment) + 1, s->second, &outSegments);
+
+                                                                        for (const auto s : outSegments)
+                                                                                transportMap.push_back({s, {target, replicas}});
+                                                                }
+                                                                else
+                                                                {
+                                                                        // this target does not currently server any segments in the current segment
+                                                                        transportMap.push_back({subSegment, {target, replicas}});
+                                                                }
+                                                        }
+                                                }
+                                        }
+                                }
+                        }
+
                         return transportMap;
                 }
         };

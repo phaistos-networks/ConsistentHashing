@@ -81,7 +81,6 @@ int main()
                 {1000, 100},
                 {150, 110},
                 {1200, 120}};
-        std::vector<token_t> nodeTokensNow, nodeTokensFuture{35, 95};
         std::vector<node_t> ringTokensNodes, ringTokens;
 
         // We need all ring tokens, and all associated nodes for those tokens.
@@ -89,9 +88,6 @@ int main()
         for (auto it = std::begin(ringStructure), end = std::end(ringStructure); it != end; ++it)
         {
                 const auto &v = *it;
-
-                if (v.first == 1)
-                        nodeTokensNow.push_back(v.second);
 
                 ringTokens.push_back(v.second);
                 ringTokensNodes.push_back(v.first);
@@ -101,59 +97,54 @@ int main()
         // In practice, you wouldn't allocate any memory here (i.e no std::vector<> use), you 'd
         // pay a lot of attention to performance, and you 'd possiblyh consider physical placement of node
         // (i.e at least one from local DC and the rest from other DCs)
-        const auto replicas_of = [](const auto &ring, const auto ringTokensNodes, const token_t token) {
-                std::vector<node_t> res;
+        const auto replicas_of = [](const auto &ring, const auto ringTokensNodes, const token_t token, node_t *const out) {
                 static constexpr uint8_t replicationFactor{2}; // how many copies of each ring segment we need at any given time
                 const auto base = ring.index_owner_of(token);  // index in the ring tokens for the token-owner of token(input)
-                uint32_t i{base};
+                uint32_t i{base}, n{0};
 
                 // walk the the ring clockwise until we have enough nodes to return
                 do
                 {
                         const auto node = ringTokensNodes[i];
 
-                        if (std::find(res.begin(), res.end(), node) == res.end())
+                        if (std::find(out, out + n, node) == out + n)
                         {
                                 // haven't collected that node yet
                                 // we only care for distinct nodes
-                                res.push_back(node);
-                                if (res.size() == replicationFactor)
+                                out[n++] = node;
+                                if (n == replicationFactor)
                                         break;
                         }
 
                         i = (i + 1) % ring.size();
                 } while (i != base);
 
-                return res;
+                return n;
         };
 
         // This is our ring
         const ring_t ring(ringTokens.data(), ringTokens.size());
+        // those are the changes
+        const std::unordered_map<node_t, std::vector<token_t>> topologyUpdates{
+            {1, {35, 95}},
+	    {110, {}}, 	// will remove node from the ring
+            {64, {7}}};
         // Figure out what needs to be transfered, the available sources for those segments, and the targets
-        auto res = ring.transition(ringTokensNodes.data(), node_t(1), nodeTokensFuture, replicas_of);
-        std::vector<decltype(res)> transfers;
+        auto updates = ring.transition(ringTokensNodes.data(), topologyUpdates, replicas_of);
 
-        transfers.push_back(std::move(res));
-        // If we wanted to do this for multiple nodes (e.g you want to add 5 more new nodes)
-        // then you should execute transition() for each of those nodes, and append those into transfers[]
-        for (const auto &ctx : transfers)
+
+	for (auto &it : updates)
         {
-                for (auto &it : ctx)
-                {
-                        auto segment = it.first;
-                        auto &fromTo = it.second;
-                        auto &sources = fromTo.first;
-                        auto &targets = fromTo.second;
+                const auto segment = it.first;
+                const auto &toFrom = it.second;
+                const auto target = toFrom.first;
+                auto sources = toFrom.second;
 
-                        // This function will consider the distance in terms of e.g network hops
-                        // from the local node to each node in sources[], and it will
-                        // filter it by keeping only the nodes that are closest to this local node
-                        //
-                        // This is important because we want to minimize the time it will take to transfered
-                        // data among ring nodes.
-                        //
-                        filter_by_distance_from_local(sources);
-                }
+                // Let's filter the sources, so that we only pull from the nodes closest to us in terms of node hopes
+                sources.resize(ring_t::filter_by_distance(sources.data(), sources.data() + sources.size(), [target](const auto node) {
+                                       return 1; // TODO: return an appropriate distance from target to node
+                               }) -
+                               sources.data());
         }
 
         // This function should consider all sources, consider opportunities for fairly scheduling of transfers
@@ -166,16 +157,11 @@ int main()
         // Eventually, the callback should be invoked, and that callback
         // should create a new final ring
 
-        schedule_transfer(std::move(transfers),
-                          [ tokensNow = std::move(nodeTokensNow), tokensFuture = std::move(nodeTokensFuture) ]{
-                              // This is the success callback.
-                              //
-                              // we should:
-                              // 1. create a new ring tokens list, that excludes tokensNow and includes tokensFuture
-                              // 2. we should create a new ring from those tokens
-                              // 3. we should assign the token tokensFuture
-                              // 4. we should set that new ring as the current ring, and gossip to the cluster about the update
+        schedule_transfer(std::move(updates),
+                          [ ringTokensNodes, ring, topologyUpdates ]() {
+                                  const auto newTopology = ring.new_topology(ringTokensNodes.data(), topologyUpdates);
 
+                                  switch_to_ring(newTopology);
                           });
         return 0;
 }
