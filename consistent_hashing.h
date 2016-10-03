@@ -740,7 +740,7 @@ namespace ConsistentHashing
                 {
                         std::vector<segment_t> res;
 
-                        res.resize(t.size());
+                        res.reserve(t.size());
                         for (const auto token : t)
                         {
                                 const auto idx = index_owner_of(token);
