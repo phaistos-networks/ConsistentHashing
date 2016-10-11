@@ -67,6 +67,83 @@ namespace ConsistentHashing
                 return l;
         }
 
+	// An 128bit token representation
+	// You should probably use 128 or more bits for the tokens space
+        struct token128
+        {
+                uint64_t ms;
+                uint64_t ls;
+
+                constexpr token128()
+			: ms{0}, ls{0}
+                {
+                }
+
+		constexpr token128(const uint64_t m, const uint64_t l)
+			: ms{m}, ls{l}
+                {
+                }
+
+		constexpr bool is_minimum() const noexcept
+		{
+			return ms == 0 && ls == 0;
+		}
+
+                constexpr operator bool() const noexcept
+                {
+                        return is_valid();
+                }
+
+                constexpr bool is_valid() const noexcept
+                {
+                        return ms || ls;
+                }
+
+                constexpr bool operator==(const token128 &o) const noexcept
+                {
+                        return ms == o.ms && ls == o.ls;
+                }
+
+                constexpr bool operator!=(const token128 &o) const noexcept
+                {
+                        return ms != o.ms || ls != o.ls;
+                }
+
+                constexpr bool operator>(const token128 &o) const noexcept
+                {
+                        return ms > o.ms || (ms == o.ms && ls > o.ls);
+                }
+
+                constexpr bool operator<(const token128 &o) const noexcept
+                {
+                        return ms < o.ms || (ms == o.ms && ls < o.ls);
+                }
+
+                constexpr bool operator>=(const token128 &o) const noexcept
+                {
+                        return ms > o.ms || (ms == o.ms && ls >= o.ls);
+                }
+
+                constexpr bool operator<=(const token128 &o) const noexcept
+                {
+                        return ms < o.ms || (ms == o.ms && ls <= o.ls);
+                }
+
+                constexpr auto &operator=(const token128 &o) noexcept
+                {
+                        ms = o.ms;
+                        ls = o.ls;
+
+                        return *this;
+                }
+
+                constexpr void reset() noexcept
+                {
+                        ms = 0;
+                        ls = 0;
+                }
+        };
+
         // A segment in a ring. The segment is responsible(owns) the tokens range
         // (left, right] 	i.e left exlusive, right inclusive
         // whereas left is the token of the predecessor segment and right is the token of this segment
@@ -77,7 +154,7 @@ namespace ConsistentHashing
                 token_t left;
                 token_t right;
 
-                uint64_t span() const noexcept
+                constexpr uint64_t span() const noexcept
                 {
                         if (wraps())
                         {
@@ -91,48 +168,48 @@ namespace ConsistentHashing
                         }
                 }
 
-                ring_segment()
+                constexpr ring_segment()
                 {
                 }
 
-                ring_segment(const token_t l, const token_t r)
+                constexpr ring_segment(const token_t l, const token_t r)
                     : left{l}, right{r}
                 {
                 }
 
-                void set(const token_t l, const token_t r)
+                constexpr void set(const token_t l, const token_t r)
                 {
                         left = l;
                         right = r;
                 }
 
                 // this segment's token
-                auto token() const noexcept
+                constexpr auto token() const noexcept
                 {
                         return right;
                 }
 
-                inline bool operator==(const ring_segment &o) const noexcept
+                constexpr bool operator==(const ring_segment &o) const noexcept
                 {
                         return left == o.left && right == o.right;
                 }
 
-                inline bool operator!=(const ring_segment &o) const noexcept
+                constexpr bool operator!=(const ring_segment &o) const noexcept
                 {
                         return left != o.left || right != o.right;
                 }
 
-                inline bool operator<(const ring_segment &o) const noexcept
+                constexpr bool operator<(const ring_segment &o) const noexcept
                 {
                         return left < o.left || (left == o.left && right < o.right);
                 }
 
-                inline bool operator>(const ring_segment &o) const noexcept
+                constexpr bool operator>(const ring_segment &o) const noexcept
                 {
                         return left > o.left || (left == o.left && right > o.right);
                 }
 
-                int8_t cmp(const ring_segment &rhs) const noexcept
+                constexpr int8_t cmp(const ring_segment &rhs) const noexcept
                 {
                         if (tokens_wrap_around(left, right))
                         {
@@ -155,7 +232,7 @@ namespace ConsistentHashing
                         }
                 }
 
-                [[gnu::always_inline]] static inline bool tokens_wrap_around(const token_t &l, const token_t &r) noexcept
+                static constexpr bool tokens_wrap_around(const token_t &l, const token_t &r) noexcept
                 {
                         // true iff extends from last to the first ring segment
                         return l >= r;
@@ -384,7 +461,7 @@ namespace ConsistentHashing
                         }
                 }
 
-                [[gnu::always_inline]] inline bool wraps() const noexcept
+                constexpr bool wraps() const noexcept
                 {
                         return tokens_wrap_around(left, right);
                 }
@@ -628,17 +705,17 @@ namespace ConsistentHashing
                 const T *const tokens;
                 const uint32_t cnt;
 
-                Ring(const T *const v, const uint32_t n)
+                constexpr Ring(const T *const v, const uint32_t n)
                     : tokens{v}, cnt{n}
                 {
                 }
 
-                Ring(const std::vector<T> &v)
+                constexpr Ring(const std::vector<T> &v)
                     : Ring{v.data(), v.size()}
                 {
                 }
 
-                inline auto size() const noexcept
+                constexpr auto size() const noexcept
                 {
                         return cnt;
                 }
@@ -684,34 +761,34 @@ namespace ConsistentHashing
                         return tokens[index_owner_of(token)];
                 }
 
-                const T &token_predecessor_by_index(const uint32_t idx) const noexcept
+                constexpr const T &token_predecessor_by_index(const uint32_t idx) const noexcept
                 {
                         return tokens[(idx + (cnt - 1)) % cnt];
                 }
 
-                const T &token_predecessor(const T token) const noexcept
+                constexpr const T &token_predecessor(const T token) const noexcept
                 {
                         return token_predecessor_by_index(index_of(token));
                 }
 
-                const T &token_successor_by_index(const uint32_t idx) const noexcept
+                constexpr const T &token_successor_by_index(const uint32_t idx) const noexcept
                 {
                         return tokens[(idx + 1) % cnt];
                 }
 
-                const T &token_successor(const T token) const noexcept
+                constexpr const T &token_successor(const T token) const noexcept
                 {
                         return token_successor_by_index(index_of(token));
                 }
 
-                auto index_segment(const uint32_t idx) const noexcept
+                constexpr auto index_segment(const uint32_t idx) const noexcept
                 {
                         return ring_segment<T>(tokens[(idx + (cnt - 1)) % cnt], tokens[idx]);
                 }
 
                 // segment in the ring that owns this token
                 // based on the (prev segment.token, this segment.token] ownership rule
-                auto token_segment(const T token) const noexcept
+                constexpr auto token_segment(const T token) const noexcept
                 {
                         return index_segment(index_of(token));
                 }
@@ -936,17 +1013,19 @@ namespace ConsistentHashing
                 }
 
 
+		// Builds a ring transition plan that is to be commited in order to transition to a new ring state.
+		// 
                 // Whenever one more nodes alters the ring topology (when joining a cluster, leaving a cluster, or acquiring a different set of tokens), we need to
                 // account for that change, by copying data to nodes that will serve segments they didn't already were serving(thus, they don't have the data for that ring space)
                 // and by copying data to nodes that will now serve as a result of one or more nodes dropping segments they used to serve. This is necessary in order to
                 // support replication semantics.
                 //
-                // You should initiate a transition, and when it is complete, create the final ring topology using
+                // You should initiate a transition PLAN, and when it is COMMITED, create the final ring topology using
                 // new_topology() like it's used here for the transient ring, and switch to it, by advertising the new tokens for all tokens in the ring.
                 //
                 // GUIDELINES
                 // - There can be only one active transition in progress. If you allow for concurrent transitions, you will almost definitely end up with
-                // invalid rings that likely contain missing data.
+                // invalid rings that likely contain missing data. You can queue new transition plans to be executed after the current plan is complete. See Riak
                 // - For existing nodes participating in the transition: They should not be stopped or otherwise be treated in any special way.
                 // - For nodes that are to join the cluster(i.e are not already participating in the ring), you should wait until the transition has completed successfully,
                 // 	and then initialize them with the tokens you used for them in the transition.
@@ -958,7 +1037,7 @@ namespace ConsistentHashing
                 //
                 // OPTIMIZATION OPPORTUNITIES
                 // - You should use filter_by_distance() to filter sources, or a similar function so that you will always select among the closest(in terms of network hops) nodes to
-                // the ring target node for streaming, in order to minimize streaming time.
+                // the ring target node for streaming, in order to minimize streaming time. Use a best-effort strategy in order to minimize data motion.
                 // - You should try to schedule the streaming operations fairly among the involved nodes. If you over-load a node and under-load the rest, or vice versa, the time
                 // and effort(cost) will be much higher.
                 //
@@ -969,12 +1048,20 @@ namespace ConsistentHashing
                 // - If you 'd like to decomission 1 node, you just need to a new transition that involves that node, and the list of tokens it will own will be empty. Once the streaming is
                 // complete, you should stop the node.
 		//
-		// MISC
-		// Maybe it's a good idea to get all nodes accept all writes for the segments they serve, even if the transition hasn't been completed, so that you won't need
-		// read-repair to deal with missing content. While the streaming is in-progress, writes for segments served by involved segments that they didn't already serve
-		// in the current ring, will be lost - unless your service can support a mode where all writes eventually will be forwarded to those nodes, either by using some
-		// sort of hinted-handoff system, or by having those nodes in the ring but only responding for reads for the current segments, and writes should get a diff. strategy.
-		// This section will be eventually revised with more concrete advise on how to do about this.
+		//
+		// ## Riak and Cassandra
+		// Effectively, this creates a transition plan. 
+		// Once you have successfully executed the transition plan, you should *commit* the changes.
+		// According to @justinsheehy an @tsantero, Riak supports on-demand resizing by arbitrary factors, and you can
+		// issue multiple resize operations(they are queued and are executed whenever the last one commits,
+		// it's possible to cancel them).
+		// It does a best-effort about minimizing movement. If a node failed during movement, HH would
+		// kick in.
+		// Like cassandra, it would keep track of 'pending segmnets' and the coordinator would push writes
+		// to them if needed. See Cassandra's method for calculating "pending ranges" and how
+		// that is beijng used in the proxy where for each write, the pending ranges list is consulted
+		// and if any pending segments match the token, the targetrs of those segments also receive the update
+		// See also: https://billo.gitbooks.io/lfe-little-riak-book/content/ch4/5.html 
                 template <typename node_t, typename L>
                 auto transition(
                     const node_t *const ringTokensNodes,
@@ -991,7 +1078,10 @@ namespace ConsistentHashing
                                         const auto replicasCnt = replicas_for(ring, ringTokensNodes, token, replicas);
 
                                         if (std::find(replicas, replicas + replicasCnt, node) != replicas + replicasCnt)
+					{
+						// We need the distinct replicas
                                                 res->push_back({ring.token_predecessor_by_index(i), token});
+					}
                                 }
 
                                 std::sort(res->begin(), res->end(), [](const auto &a, const auto &b) { return a.left < b.left; });
@@ -1005,7 +1095,10 @@ namespace ConsistentHashing
                         const auto currentRingSegments = segments();
                         std::vector<segment_t> outSegments;
                         segment_t segmentsList[2];
-                        std::vector<std::pair<segment_t, std::pair<node_t, std::vector<node_t>>>> transportMap;
+			// The plan to execute to transition to the new ring
+			// A list of:
+			// (ring segment, target node, replicas)
+                        std::vector<std::pair<segment_t, std::pair<node_t, std::vector<node_t>>>> plan;
                         std::unordered_map<node_t, std::vector<segment_t>> curRingServeMap;
                         std::vector<node_t> replicas;
                         node_t tokenReplicas[maxReplicasCnt], futureReplicas[maxReplicasCnt];
@@ -1052,14 +1145,15 @@ namespace ConsistentHashing
                                 segments_of(transientRing, transientRingTokensNodes.data(), node, &replicaForSegmentsFuture);
                                 segments_of(*this, ringTokensNodes, node, &replicaForSegmentsNow);
 
+
                                 // Compute what needs to be delivered to _this_ node
                                 for (const auto futureSegment : replicaForSegmentsFuture)
                                 {
                                         //  Mask segments this node serves already, no need to acquire any content we already have
 					const auto futureSegmentWraps = futureSegment.wraps();
+
                                         outSegments.clear();
                                         segment_t::mask_segments(&futureSegment, (&futureSegment) + 1, replicaForSegmentsNow, &outSegments);
-
 
                                         if (outSegments.empty())
                                         {
@@ -1068,7 +1162,7 @@ namespace ConsistentHashing
                                         }
 
 					// TODO: use binary search to locate the next segment in currentRingSegments
-					// No need for the linear scan
+					// No need for the linear scan: https://github.com/phaistos-networks/ConsistentHashing/issues/1
 
 
                                         // OK, so who's going to provide content for those segments, based on the current ring?
@@ -1093,7 +1187,7 @@ namespace ConsistentHashing
                                                 const std::vector<node_t> replicas(tokenReplicas, tokenReplicas + replicas_for(*this, ringTokensNodes, it.right, tokenReplicas));
 
                                                 for (uint8_t i{0}; i != cnt; ++i)
-                                                        transportMap.push_back({segmentsList[i], {node, replicas}}); // from replicas, to node, that segment
+                                                        plan.push_back({segmentsList[i], {node, replicas}}); // from replicas, to node, that segment
                                         }
                                 }
 
@@ -1106,7 +1200,7 @@ namespace ConsistentHashing
                                         bool haveSources{false};
 
 					// TODO: use binary search to locate the next segment in transientRingSegments
-					// No need for linear scan
+					// No need for linear scan: https://github.com/phaistos-networks/ConsistentHashing/issues/1
 
                                         for (const auto futureSegment : transientRingSegments)
                                         {
@@ -1136,7 +1230,7 @@ namespace ConsistentHashing
                                                                                                       }
                                                                                                       else if (futureNodesTokens.find(target) != futureNodesTokens.end())
                                                                                                       {
-                                                                                                              // exclude nodes that are also involved in this process, otherwise we may output the same value twice in transportMap
+                                                                                                              // exclude nodes that are also involved in this process, otherwise we may output the same value twice in plan
                                                                                                               return true;
                                                                                                       }
                                                                                                       else
@@ -1172,12 +1266,12 @@ namespace ConsistentHashing
                                                                         segment_t::mask_segments(&subSegment, (&subSegment) + 1, s->second, &outSegments);
 
                                                                         for (const auto s : outSegments)
-                                                                                transportMap.push_back({s, {target, replicas}});
+                                                                                plan.push_back({s, {target, replicas}});
                                                                 }
                                                                 else
                                                                 {
                                                                         // this target does not currently server any segments in the current segment
-                                                                        transportMap.push_back({subSegment, {target, replicas}});
+                                                                        plan.push_back({subSegment, {target, replicas}});
                                                                 }
                                                         }
                                                 }
@@ -1185,7 +1279,7 @@ namespace ConsistentHashing
                                 }
                         }
 
-                        return transportMap;
+                        return plan;
                 }
         };
 }
