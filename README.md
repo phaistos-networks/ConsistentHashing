@@ -1,7 +1,7 @@
 This is an C++14 implementation of [Consistent hashing](https://en.wikipedia.org/wiki/Consistent_hashing), abstracted as a `Ring` of tokens, with a `ring_segment` data structure that represents a segment of the ring. [We](http://phaistosnetworks.gr/) have been using this implementation for many years in building multiple distributed systems, including our massive scale, high performance distributed store (CloudDS). 
 
 Please check the comments in the single header file for how to use the data structures and their APIs, and how it works. 
-It is pretty trivial to use it and various useful methods are implemented for building robust distributed services.
+It is pretty trivial to use it and various useful methods are implemented for building robust distributed services. You should also check the wiki, startng with the [transition plan page](https://github.com/phaistos-networks/ConsistentHashing/wiki/Transition-Plan)
 
 ### Using it in your Project
 Just include [consistent_hashing.h](https://github.com/phaistos-networks/ConsistentHashing/blob/master/consistent_hashing.h), and make sure you set `std=c++14` or higher compiler option.
@@ -55,6 +55,7 @@ namespace std
 This is really not that much work, and chances are you are already doing that anyway to support other needs of your codebase.
 
 ### Example
+Please read about [transition plans](https://github.com/phaistos-networks/ConsistentHashing/wiki/Transition-Plan) first.
 
 ```cpp
 #include <consistent_hashing.h>
@@ -129,11 +130,11 @@ int main()
             {1, {35, 95}},
 	    {110, {}}, 	// will remove node from the ring
             {64, {7}}};
-        // Figure out what needs to be transfered, the available sources for those segments, and the targets
-        auto updates = ring.transition(ringTokensNodes.data(), topologyUpdates, replicas_of);
+        // Create the transition plan
+        auto plan = ring.transition(ringTokensNodes.data(), topologyUpdates, replicas_of);
 
 
-	for (auto &it : updates)
+	for (auto &it : plan)
         {
                 const auto segment = it.first;
                 const auto &toFrom = it.second;
@@ -147,17 +148,9 @@ int main()
                                sources.data());
         }
 
-        // This function should consider all sources, consider opportunities for fairly scheduling of transfers
-        // across the distinct sources, and otherwise do what it takes to transfer data among nodes
-        //
-        // One way to do this is to register a new "transfer session", and coordinate the process among all
-        // ring nodes involved. In case of failure, the participating nodes should also abort.
-        // You should also make sure that only one transfer is active at any given time.
-        //
-        // Eventually, the callback should be invoked, and that callback
-        // should create a new final ring
-
-        schedule_transfer(std::move(updates),
+     
+       // Please read https://github.com/phaistos-networks/ConsistentHashing/wiki/Transition-Plan
+        schedule_transfer(std::move(plan),
                           [ ringTokensNodes, ring, topologyUpdates ]() {
                                   const auto newTopology = ring.new_topology(ringTokensNodes.data(), topologyUpdates);
 
